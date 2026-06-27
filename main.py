@@ -1,3 +1,9 @@
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import os
 import streamlit as st
 from workflows import run_full_pipeline, regenerate_cheatsheet_workflow, regenerate_study_plan_workflow
@@ -470,6 +476,11 @@ if "current_results" not in st.session_state:
 if "selected_subject" not in st.session_state:
     st.session_state.selected_subject = None
 
+if "cache_warmed" not in st.session_state:
+     from datastore import prewarm_cache
+     prewarm_cache()
+     st.session_state.cache_warmed = True
+
 
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -498,29 +509,69 @@ with st.sidebar:
             f.write(uploaded_zip.read())
 
         if st.button("Run Analysis", use_container_width=True):
-            with st.spinner("Analyzing all subjects..."):
-                result = run_full_pipeline(temp_zip_path, days_remaining, force_rerun=force_rerun)
+            status_box = st.status("Starting analysis...", expanded=True)
+
+            def progress_cb(subject, step, total, message):
+                status_box.update(
+                    label=f"[{subject}] Step {step}/{total}: {message}",
+                    state="running",
+                )
+                status_box.write(f"[{subject}] Step {step}/{total}: {message}")
+
+            try:
+                result = run_full_pipeline(
+                    temp_zip_path,
+                    days_remaining,
+                    force_rerun=force_rerun,
+                    progress_callback=progress_cb,
+                )
+
                 if result["status"] == "success":
                     st.session_state.current_results = result["results"]
                     subjects_found = result.get("subjects_processed", [])
-                    st.success(f"Done. Found: {', '.join(subjects_found)}")
+                    status_box.update(
+                        label=f"Done. Analyzed: {', '.join(subjects_found)}",
+                        state="complete",
+                        expanded=False,
+                    )
                     if result.get("errors"):
                         for subj, err in result["errors"].items():
                             st.warning(f"{subj}: {err}")
                 else:
-                    st.error(result.get("error", "Something went wrong"))
+                    status_box.update(
+                        label=result.get("error", "Something went wrong"),
+                        state="error",
+                    )
+            except Exception as e:
+                status_box.update(label=f"Pipeline crashed: {e}", state="error")
+                st.exception(e)
 
     st.markdown('<hr style="border-color: #2a2a2a; margin: 20px 0;">', unsafe_allow_html=True)
     st.markdown('<span class="section-label">Saved Subjects</span>', unsafe_allow_html=True)
 
+with st.sidebar:
     saved = list_saved_subjects()
-    if saved:
-        for subj in saved:
-            col_a, col_b = st.columns([3, 1])
-            if col_a.button(subj, use_container_width=True, key=f"saved_{subj}"):
+    # De-duplicate while preserving order
+    seen = set()
+    saved_unique = []
+    for s in saved:
+        if s and s not in seen:
+            seen.add(s)
+            saved_unique.append(s)
+
+    if saved_unique:
+        for idx, subj in enumerate(saved_unique):
+            if st.button(
+                subj,
+                use_container_width=True,
+                key=f"saved_{idx}_{subj}",
+            ):
                 st.session_state.selected_subject = subj
     else:
-        st.markdown('<p style="color: #5a5a5a; font-size: 13px;">No saved subjects yet</p>', unsafe_allow_html=True)
+        st.markdown(
+            '<p style="color:#5a5a5a;font-size:13px;">No saved subjects yet</p>',
+            unsafe_allow_html=True,
+        )
 
 
 # ── AUTO-SELECT FIRST SUBJECT AFTER ANALYSIS ─────────────────────────────────

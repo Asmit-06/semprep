@@ -1,241 +1,430 @@
+"""
+workflows.py
+------------
+Orchestrates SEMPREP end-to-end:
+  1. Extracts ZIP via file_processor.process_upload()
+  2. For each detected subject, calls run_full_lemma_pipeline()
+  3. Saves each subject's analysis to Lemma tables
+  4. Returns aggregated results in the shape main.py expects
+
+Routes between Lemma agents pipeline and local OpenRouter pipeline
+based on the USE_LEMMA environment variable.
+"""
+
 import os
+import time
+import logging
+import tempfile
 import shutil
-from pathlib import Path
-from file_processor import process_upload
-from agent import run_full_analysis
-from datastore import save_subject_data, load_subject_data, save_session, get_weak_topics
+from typing import Optional, Callable
 
-TEMP_DIR = "temp_extracted"
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
+logger = logging.getLogger(__name__)
 
-def cleanup_temp():
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
-    Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
+USE_LEMMA = os.getenv("USE_LEMMA", "false").lower() in ("true", "1", "yes")
 
-
-def get_pyq_texts(subject_bucket: dict) -> list:
-    pyq_texts = []
-    for file_data in subject_bucket.get("PYQ", []):
-        text = file_data.get("raw_text", "")
-        if text:
-            pyq_texts.append(text)
-    return pyq_texts
+# Minimum extracted text length before we bother running agents.
+# Anything less is almost certainly an OCR failure or empty PDF.
+MIN_TEXT_CHARS = 100
 
 
-def get_notes_texts(subject_bucket: dict) -> list:
-    notes_texts = []
-    for file_data in subject_bucket.get("Notes", []):
-        text = file_data.get("raw_text", "")
-        if text:
-            notes_texts.append(text)
-    for file_data in subject_bucket.get("Reference", []):
-        text = file_data.get("raw_text", "")
-        if text:
-            notes_texts.append(text)
-    return notes_texts
+# ============================================================
+# Main entry point — called by Streamlit main.py
+# ============================================================
 
+def run_full_pipeline(
+    zip_path: str,
+    days_remaining: int = 14,
+    force_rerun: bool = False,
+    progress_callback: Optional[Callable] = None,
+) -> dict:
+    """
+    Top-level pipeline.
 
-def estimate_total_years(pyq_texts: list) -> int:
-    import re
-    years = set()
-    for text in pyq_texts:
-        found = re.findall(r'\b(20\d{2})\b', text)
-        for y in found:
-            years.add(y)
-    if len(years) == 0:
-        return 3
-    return max(len(years), 1)
+    Args:
+        zip_path:           path to uploaded ZIP file
+        days_remaining:     days until exam
+        force_rerun:        if True, re-analyze even already-saved subjects
+        progress_callback:  optional fn(subject, step, total, message) for UI
 
-def run_subject_workflow(subject: str, subject_bucket: dict, days_remaining: int, force_rerun: bool = False) -> dict:
-    if not force_rerun:
-        existing = load_subject_data(subject)
-        if existing:
-            print(f"Loaded {subject} from cache")
+    Returns:
+        {
+            "status": "success" | "error",
+            "results": {subject_name: analysis_dict, ...},
+            "subjects_processed": [subject_names],
+            "errors": {subject_name: error_message, ...},
+            "error": str | None,
+        }
+    """
+    from file_processor import process_upload
+    from datastore import list_saved_subjects
+
+    # Step 1 — extract ZIP and bucket files by subject
+    extract_dir = tempfile.mkdtemp(prefix="semprep_")
+    try:
+        try:
+            subject_buckets = process_upload(zip_path, extract_dir)
+        except Exception as e:
+            logger.exception("process_upload failed")
             return {
-                "status": "loaded_from_cache",
-                "subject": subject,
-                "data": existing
+                "status": "error",
+                "error": f"Failed to extract ZIP: {e}",
+                "results": {},
+                "subjects_processed": [],
+                "errors": {},
             }
 
-    pyq_texts = get_pyq_texts(subject_bucket)
+        if not subject_buckets:
+            return {
+                "status": "error",
+                "error": "No files found in ZIP",
+                "results": {},
+                "subjects_processed": [],
+                "errors": {},
+            }
 
-    all_texts = []
-    for ftype in ["PYQ", "Notes", "Reference", "Unknown"]:
-        for file_data in subject_bucket.get(ftype, []):
-            text = file_data.get("raw_text", "")
-            if text.strip():
-                all_texts.append(text)
-
-    if not all_texts:
-        return {
-            "status": "error",
-            "subject": subject,
-            "error": f"No readable files found for {subject}"
-        }
-
-    total_years = estimate_total_years(pyq_texts) if pyq_texts else 1
-    weak_topics = get_weak_topics(subject)
-
-    print(f"Running analysis for {subject}: {len(all_texts)} total files, {len(pyq_texts)} PYQs, {total_years} years")
-
-    analysis_result = run_full_analysis(
-        subject=subject,
-        pyq_texts=pyq_texts,
-        total_years=total_years,
-        days_remaining=days_remaining,
-        weak_topics=weak_topics,
-        all_texts=all_texts
-    )
-
-    save_subject_data(subject, analysis_result)
-
-    return {
-        "status": "success",
-        "subject": subject,
-        "data": analysis_result
-    }
-
-def run_full_pipeline(zip_path: str, days_remaining: int, selected_subjects: list = None, force_rerun: bool = False) -> dict:
-    cleanup_temp()
-
-    print("Extracting ZIP and detecting subjects per file...")
-    subject_buckets = process_upload(zip_path, TEMP_DIR)
-
-    if not subject_buckets:
-        return {
-            "status": "error",
-            "error": "No processable files found in the ZIP.",
-            "results": {}
-        }
-
-    if selected_subjects:
-        subject_buckets = {k: v for k, v in subject_buckets.items() if k in selected_subjects}
-
-    subject_buckets.pop("Unknown", None)
-
-    if not subject_buckets:
-        return {
-            "status": "error",
-            "error": "Could not detect any known subjects. Check filenames or content.",
-            "results": {}
-        }
-
-    print(f"Subjects detected: {list(subject_buckets.keys())}")
-
-    results = {}
-    errors = {}
-
-    for subject, bucket in subject_buckets.items():
-        print(f"Processing subject: {subject}")
-        result = run_subject_workflow(
-            subject=subject,
-            subject_bucket=bucket,
-            days_remaining=days_remaining,
-            force_rerun=force_rerun
+        logger.info(
+            f"Extracted {len(subject_buckets)} subject buckets: "
+            f"{list(subject_buckets.keys())}"
         )
 
-        if result["status"] == "error":
-            errors[subject] = result["error"]
-        else:
-            results[subject] = result["data"]
+        try:
+            already_saved = set(list_saved_subjects()) if not force_rerun else set()
+        except Exception as e:
+            logger.warning(f"Could not load saved subjects list: {e}")
+            already_saved = set()
 
-    session_data = {
-        "zip_path": zip_path,
-        "days_remaining": days_remaining,
-        "subjects_processed": list(results.keys()),
-        "subjects_failed": list(errors.keys()),
-        "selected_subjects": selected_subjects
-    }
-    save_session(session_data)
+        results = {}
+        errors = {}
+        subjects_processed = []
 
-    return {
-        "status": "success" if results else "error",
-        "results": results,
-        "errors": errors,
-        "subjects_found": list(subject_buckets.keys()),
-        "subjects_processed": list(results.keys())
-    }
+        for subject, file_type_buckets in subject_buckets.items():
+            total_files = sum(len(v) for v in file_type_buckets.values())
+            if total_files == 0:
+                continue
 
+            # For "Unknown" bucket, let the subject_detector agent figure out
+            # the real subject from the text. Do NOT skip.
+            is_unknown_bucket = (subject == "Unknown")
+            if is_unknown_bucket:
+                logger.info(
+                    f"'Unknown' bucket has {total_files} files — "
+                    f"letting subject_detector agent identify"
+                )
+                subject_hint = None
+            else:
+                subject_hint = subject
 
-def regenerate_cheatsheet_workflow(subject: str, days_remaining: int) -> str:
-    from agent import generate_cheatsheet
-    from datastore import get_weak_topics, load_subject_data, save_subject_data
+            # Skip if already analyzed and not forcing rerun
+            # (only for known subjects — Unknown bucket always runs)
+            if (
+                subject in already_saved
+                and not force_rerun
+                and not is_unknown_bucket
+            ):
+                logger.info(
+                    f"Skipping '{subject}' — already analyzed "
+                    f"(use force_rerun=True to redo)"
+                )
+                subjects_processed.append(subject)
+                from datastore import load_subject_data
+                try:
+                    cached = load_subject_data(subject)
+                    if cached:
+                        results[subject] = cached
+                except Exception as e:
+                    logger.warning(f"Could not load cached '{subject}': {e}")
+                continue
 
-    data = load_subject_data(subject)
-    if not data:
-        return "No data found for this subject. Please run the full analysis first."
+            # Flatten files for this subject into {filename: text}
+            extracted_text = _flatten_subject_files(file_type_buckets)
+            if not extracted_text:
+                errors[subject] = "No usable text extracted from files"
+                logger.warning(f"Skipping '{subject}': no usable text")
+                continue
 
-    weak_topics = get_weak_topics(subject)
-    weighted_topics = data.get("weighted_topics", {})
+            # Skip if total extracted text is too small (likely OCR failure)
+            total_chars = sum(len(t) for t in extracted_text.values())
+            if total_chars < MIN_TEXT_CHARS:
+                errors[subject] = (
+                    f"Too little text extracted ({total_chars} chars) — "
+                    f"likely OCR failure"
+                )
+                logger.warning(
+                    f"Skipping '{subject}': only {total_chars} chars extracted"
+                )
+                continue
 
-    new_cheatsheet = generate_cheatsheet(
-        weighted_topics=weighted_topics,
-        weak_topics=weak_topics,
-        subject=subject
-    )
+            logger.info(
+                f"Running pipeline for '{subject}' "
+                f"({len(extracted_text)} files, {total_chars} chars)"
+            )
 
-    data["cheatsheet"] = new_cheatsheet
-    save_subject_data(subject, data)
-    return new_cheatsheet
+            try:
+                # ── Retry wrapper: up to 2 retries on network timeout ──────
+                _pipe_last_err = None
+                analysis = None
+                for _attempt in range(3):
+                    try:
+                        analysis = _run_subject_pipeline(
+                            subject_hint=subject_hint,
+                            extracted_text=extracted_text,
+                            days_remaining=days_remaining,
+                            progress_callback=lambda step, total, msg, s=subject: (
+                                progress_callback(s, step, total, msg)
+                                if progress_callback else None
+                            ),
+                        )
+                        break  # success — exit retry loop
+                    except Exception as _e:
+                        _pipe_last_err = _e
+                        _err_str = str(_e)
+                        _is_timeout = (
+                            "ConnectTimeout" in _err_str
+                            or "LemmaTimeout" in _err_str
+                            or "10060" in _err_str
+                            or "timed out" in _err_str.lower()
+                        )
+                        if _is_timeout and _attempt < 2:
+                            _wait = 15 * (_attempt + 1)
+                            print(
+                                f"  [retry {_attempt+1}/2] Network timeout on "
+                                f"'{subject}', waiting {_wait}s..."
+                            )
+                            logger.warning(
+                                f"Network timeout on '{subject}' "
+                                f"(attempt {_attempt+1}/3), retrying in {_wait}s"
+                            )
+                            time.sleep(_wait)
+                        else:
+                            # Non-timeout error OR out of retries — bubble up
+                            raise
+                # ── End retry wrapper ────────────────────────────────────
 
+                # Use the AGENT-DETECTED subject name as storage key.
+                # This is critical for the Unknown bucket — the agent may
+                # detect that "Unknown" files are actually Computer Networks etc.
+                detected_subject = analysis.get("subject") or subject
+                if not detected_subject or detected_subject == "Unknown":
+                    detected_subject = f"Subject_{len(results) + 1}"
 
-def regenerate_study_plan_workflow(subject: str, days_remaining: int) -> str:
-    from agent import generate_study_plan
-    from datastore import load_subject_data, save_subject_data
+                # If detected name collides with an already-processed subject,
+                # merge by keeping the longer/richer analysis (simple heuristic)
+                if detected_subject in results:
+                    logger.info(
+                        f"'{detected_subject}' already processed in this run, "
+                        f"appending bucket data"
+                    )
+                    # For now just overwrite; in a future version we could merge
+                    # question_bank, flashcards etc.
 
-    data = load_subject_data(subject)
-    if not data:
-        return "No data found for this subject. Please run the full analysis first."
+                _save_analysis(
+                    detected_subject,
+                    analysis,
+                    zip_filename=os.path.basename(zip_path),
+                )
 
-    weighted_topics = data.get("weighted_topics", {})
+                results[detected_subject] = analysis
+                if detected_subject not in subjects_processed:
+                    subjects_processed.append(detected_subject)
+                logger.info(f"Completed '{detected_subject}'")
 
-    new_plan = generate_study_plan(
-        weighted_topics=weighted_topics,
-        days_remaining=days_remaining,
-        subject=subject
-    )
+            except Exception as e:
+                logger.exception(f"Pipeline failed for bucket '{subject}'")
+                errors[subject] = str(e)
 
-    data["study_plan"] = new_plan
-    save_subject_data(subject, data)
-    return new_plan
-
-
-def get_subject_summary(subject: str) -> dict:
-    from datastore import load_subject_data, load_progress
-
-    data = load_subject_data(subject)
-    progress = load_progress(subject)
-
-    if not data:
         return {
-            "subject": subject,
-            "status": "not_analyzed",
-            "total_topics": 0,
-            "critical_topics": 0,
-            "high_topics": 0,
-            "weak_topics": progress.get("weak_topics", []),
-            "mastered_topics": progress.get("mastered_topics", [])
+            "status": "success" if subjects_processed else "error",
+            "results": results,
+            "subjects_processed": subjects_processed,
+            "errors": errors,
+            "error": None if subjects_processed else "No subjects could be analyzed",
         }
 
-    weighted_topics = data.get("weighted_topics", {})
-    topics_list = []
+    finally:
+        # Always clean up extracted temp files
+        try:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        except Exception:
+            pass
 
-    if isinstance(weighted_topics, dict):
-        topics_list = weighted_topics.get("weighted_topics") or weighted_topics.get("topics") or []
-    elif isinstance(weighted_topics, list):
-        topics_list = weighted_topics
 
-    critical = [t for t in topics_list if t.get("weight", 0) >= 9]
-    high = [t for t in topics_list if 7 <= t.get("weight", 0) < 9]
+# ============================================================
+# Pipeline dispatch (Lemma vs local OpenRouter)
+# ============================================================
 
-    return {
-        "subject": subject,
-        "status": "analyzed",
-        "total_topics": len(topics_list),
-        "critical_topics": len(critical),
-        "high_topics": len(high),
-        "weak_topics": progress.get("weak_topics", []),
-        "mastered_topics": progress.get("mastered_topics", []),
-        "last_updated": data.get("last_updated")
-    }
+def _run_subject_pipeline(
+    subject_hint: Optional[str],
+    extracted_text: dict,
+    days_remaining: int,
+    progress_callback: Optional[Callable] = None,
+) -> dict:
+    """Route to Lemma agents or local OpenRouter based on USE_LEMMA flag."""
+    if USE_LEMMA:
+        from lemma_pipeline import run_full_lemma_pipeline
+        return run_full_lemma_pipeline(
+            extracted_text=extracted_text,
+            days_remaining=days_remaining,
+            subject_hint=subject_hint,
+            progress_callback=progress_callback,
+        )
+    else:
+        from agent import run_full_analysis
+        return run_full_analysis(
+            extracted_text=extracted_text,
+            days_remaining=days_remaining,
+            subject_hint=subject_hint,
+            progress_callback=progress_callback,
+        )
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def _flatten_subject_files(file_type_buckets: dict) -> dict:
+    """
+    Convert {"PYQ": [file_dict, ...], "Notes": [...], ...}
+    into {"filename.pdf": "raw_text", ...} for the pipeline.
+    Prefixes filename with file_type so agents can see context.
+    """
+    out = {}
+    for file_type, files in file_type_buckets.items():
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            fname = f.get("filename", "unknown.pdf")
+            text = f.get("raw_text", "") or ""
+            if not text.strip():
+                continue
+            # Tag filename so agents know its type
+            key = f"[{file_type}] {fname}" if file_type != "Unknown" else fname
+            out[key] = text
+    return out
+
+
+def _save_analysis(subject: str, analysis: dict, zip_filename: str = ""):
+    """Persist analysis to Lemma tables via lemma_store."""
+    try:
+        from lemma_store import save_full_analysis
+        save_full_analysis(subject, analysis, zip_filename=zip_filename)
+        logger.info(f"Saved '{subject}' to Lemma tables")
+    except Exception as e:
+        logger.warning(f"Could not save '{subject}' to Lemma: {e}")
+
+
+# ============================================================
+# Regenerate helpers (called by main.py for tab-level refresh)
+# ============================================================
+
+def regenerate_cheatsheet_workflow(subject: str, days_remaining: int = 7) -> dict:
+    """
+    Re-run only the cheatsheet step for a subject using its existing analysis.
+    """
+    from datastore import load_subject_data
+    from lemma_store import save_markdown_artifact, save_cheatsheet_entries
+
+    data = load_subject_data(subject)
+    if not data:
+        return {"status": "error", "error": "Subject not found"}
+
+    if USE_LEMMA:
+        from lemma_pipeline import step_cheatsheet_writer, _extract_list, _extract_str
+        topics = data.get("topics_raw") or _topics_from_analysis(data)
+        combined_text = data.get("source_text", "")
+
+        try:
+            out = step_cheatsheet_writer(combined_text, subject, topics)
+            entries = _extract_list(out, "cheatsheet", "entries", "sections")
+            markdown = _extract_str(out, "markdown", "content")
+
+            if entries:
+                save_cheatsheet_entries(subject, [
+                    {"topic": e.get("topic", ""), "content": e.get("content", "")}
+                    for e in entries
+                ])
+
+            if markdown:
+                save_markdown_artifact(subject, "cheatsheet", markdown)
+
+            return {"status": "success", "entries": entries, "markdown": markdown}
+        except Exception as e:
+            logger.exception("regenerate_cheatsheet_workflow failed")
+            return {"status": "error", "error": str(e)}
+
+    return {"status": "error", "error": "Regenerate only supported with USE_LEMMA=true"}
+
+
+def regenerate_study_plan_workflow(subject: str, days_remaining: int = 7) -> dict:
+    """Re-run only the study planner for a subject."""
+    from datastore import load_subject_data
+    from lemma_store import save_study_plan
+
+    data = load_subject_data(subject)
+    if not data:
+        return {"status": "error", "error": "Subject not found"}
+
+    if USE_LEMMA:
+        from lemma_pipeline import step_planner, _extract_list
+        topics = _topics_from_analysis(data)
+        qb_size = _count_qb(data)
+        fc_count = _count_flashcards(data)
+
+        try:
+            out = step_planner(
+                subject=subject,
+                topics=topics,
+                days_remaining=days_remaining,
+                question_bank_size=qb_size,
+                flashcard_count=fc_count,
+            )
+            plan = _extract_list(out, "study_plan", "plan", "days")
+            if plan:
+                save_study_plan(subject, [
+                    {
+                        "day_number": d.get("day", 1),
+                        "topics": d.get("topics", []),
+                        "estimated_hours": d.get("estimated_hours", 2.0),
+                        "status": "pending",
+                    }
+                    for d in plan
+                ])
+            return {"status": "success", "study_plan": plan}
+        except Exception as e:
+            logger.exception("regenerate_study_plan_workflow failed")
+            return {"status": "error", "error": str(e)}
+
+    return {"status": "error", "error": "Regenerate only supported with USE_LEMMA=true"}
+
+
+def _topics_from_analysis(data: dict) -> list:
+    """Best-effort topic extraction from a cached analysis dict."""
+    wt = data.get("weighted_topics", {})
+    if isinstance(wt, dict):
+        return wt.get("weighted_topics") or wt.get("topics") or []
+    if isinstance(wt, list):
+        return wt
+    return data.get("topics", [])
+
+
+def _count_qb(data: dict) -> int:
+    qb = data.get("question_bank", "")
+    if isinstance(qb, list):
+        return len(qb)
+    if isinstance(qb, str):
+        return qb.count("\n") // 2 if qb else 0
+    return 0
+
+
+def _count_flashcards(data: dict) -> int:
+    fc = data.get("flashcards", "")
+    if isinstance(fc, list):
+        return len(fc)
+    if isinstance(fc, str):
+        return fc.count("\n") // 2 if fc else 0
+    return 0

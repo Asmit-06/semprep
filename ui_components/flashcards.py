@@ -1,154 +1,245 @@
 import streamlit as st
-from .parser import parse_flashcard_text
+import re
 
-def render_flashcards(data, subject):
-    
-    st.markdown("""
-<style>
 
-/* Prev, Next, Flip buttons */
-.stButton > button {
-    color: #FFC000 !important;
-    border: 1px solid #FFC000 !important;
-    background-color: transparent !important;
-    font-weight: 600 !important;
-    letter-spacing: 1px;
-    transition: all 0.3s ease;
-}
+# ─────────────────────────────────────────────────────────────
+# PARSER
+# ─────────────────────────────────────────────────────────────
 
-/* Hover effect */
-.stButton > button:hover {
-    background-color: rgba(255, 192, 0, 0.1) !important;
-    color: #FFD54F !important;
-    border-color: #FFD54F !important;
-}
+def parse_flashcards(fc_text: str) -> list:
+    """
+    Canonical format:
+        ## TOPIC: OSI Model
+        FRONT: What is layer 2?
+        BACK: Data Link Layer
+        ---
 
-/* Click effect */
-.stButton > button:active {
-    background-color: rgba(255, 192, 0, 0.2) !important;
-}
+    Returns flat list of {topic, front, back}
+    """
+    if not fc_text:
+        return []
 
-</style>
-""", unsafe_allow_html=True)
-    st.subheader("Interactive Flashcards")
+    fc_text = re.sub(r"```[a-z]*\n?", "", fc_text).replace("```", "").strip()
 
-    weighted_topics = data.get("weighted_topics", {})
-    flashcard_text = data.get("flashcards", "")
+    cards = []
 
-    topics_list = []
-    if isinstance(weighted_topics, dict):
-        if "weighted_topics" in weighted_topics:
-            topics_list = weighted_topics["weighted_topics"]
-        elif "topics" in weighted_topics:
-            topics_list = weighted_topics["topics"]
-    elif isinstance(weighted_topics, list):
-        topics_list = weighted_topics
+    # Split on ## TOPIC: lines
+    topic_blocks = re.split(r'\n##\s+TOPIC:\s*', fc_text)
 
-    parsed_cards = parse_flashcard_text(flashcard_text)
+    for block in topic_blocks:
+        block = block.strip()
+        if not block or block.startswith("# "):
+            continue
 
-    if parsed_cards:
-        cards = parsed_cards
-    else:
-        cards = []
-        for topic in topics_list:
-            if topic.get("weight", 0) >= 7:
-                questions = topic.get("questions", [])
-                for q in questions:
-                    cards.append({
-                        "topic": topic.get("topic_name", "Unknown"),
-                        "front": str(q),
-                        "back": f"Topic: {topic.get('topic_name')}\nWeight: {topic.get('weight', 0):.1f}\nYears: {', '.join(map(str, topic.get('years_appeared', [])))}\nMarks: {topic.get('typical_marks', 'N/A')}",
-                        "weight": topic.get("weight", 0)
-                    })
+        lines  = block.split("\n", 1)
+        topic  = lines[0].strip()
+        body   = lines[1] if len(lines) > 1 else ""
 
+        # Each card separated by ---
+        card_blocks = re.split(r'\n---+\n?', body)
+
+        for cb in card_blocks:
+            cb = cb.strip()
+            if not cb:
+                continue
+            front = _field(cb, "FRONT")
+            back  = _field(cb, "BACK")
+            if front:
+                cards.append({"topic": topic, "front": front, "back": back})
+
+    # Fallback: ## Card N format
     if not cards:
-        st.info("No flashcards available. Questions need to be extracted from PYQs first.")
-        if flashcard_text:
-            st.markdown(flashcard_text)
+        cards = _parse_legacy_flashcards(fc_text)
+
+    return cards
+
+
+def _field(text: str, name: str) -> str:
+    m = re.search(rf'^{name}:\s*(.+)$', text, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _parse_legacy_flashcards(text: str) -> list:
+    """Fallback: ## Card N / **Q:** / **A:** format."""
+    cards = []
+    blocks = re.split(r'\n##\s+Card\s+\d+', text)
+    for block in blocks:
+        block = block.strip()
+        topic_m = re.search(r'\*Topic:\s*(.+?)\*', block)
+        topic   = topic_m.group(1).strip() if topic_m else "General"
+        q_m = re.search(r'\*\*Q:\*\*\s*(.+?)(?=\n\s*\*\*A:|\Z)', block, re.DOTALL)
+        a_m = re.search(r'\*\*A:\*\*\s*(.+?)$', block, re.DOTALL)
+        front = re.sub(r'\s+', ' ', q_m.group(1).strip()) if q_m else ""
+        back  = re.sub(r'\s+', ' ', a_m.group(1).strip()) if a_m else ""
+        if front:
+            cards.append({"topic": topic, "front": front, "back": back})
+    return cards
+
+
+# ─────────────────────────────────────────────────────────────
+# RENDER
+# ─────────────────────────────────────────────────────────────
+
+def render_flashcards(data: dict,subject: str = None):
+    fc_text = data.get("flashcards", "") or ""
+    fc_text = re.sub(r"```[a-z]*\n?", "", fc_text).replace("```", "").strip()
+
+    if not fc_text:
+        st.markdown(
+            "<div style='text-align:center;padding:60px 20px;color:#444;"
+            "font-family:Inter,sans-serif;font-size:14px;'>"
+            "No flashcards available.</div>",
+            unsafe_allow_html=True,
+        )
         return
 
-    if f"card_idx_{subject}" not in st.session_state:
-        st.session_state[f"card_idx_{subject}"] = 0
-    if f"flipped_{subject}" not in st.session_state:
-        st.session_state[f"flipped_{subject}"] = False
+    cards = parse_flashcards(fc_text)
 
-    current_idx = st.session_state[f"card_idx_{subject}"]
-    current_idx = min(current_idx, len(cards) - 1)
-    card = cards[current_idx]
+    if not cards:
+        st.warning("Could not parse flashcards. Showing raw output below.")
+        with st.expander("Raw flashcards"):
+            st.text(fc_text[:5000])
+        return
 
-    col1, col2, col3 = st.columns([1, 3, 1])
+    # ── Topic filter ──
+    topics = ["All"] + sorted(set(c["topic"] for c in cards if c["topic"]))
 
+    col1, col2 = st.columns([3, 1])
     with col1:
-        if st.button("← Prev", use_container_width=True):
-            st.session_state[f"card_idx_{subject}"] = max(0, current_idx - 1)
-            st.session_state[f"flipped_{subject}"] = False
-            st.rerun()
-
+        selected_topic = st.selectbox(
+            "Filter by topic",
+            topics,
+            label_visibility="collapsed",
+            key="fc_topic_filter",
+        )
     with col2:
-        topic_label = card.get("topic", card.get("front", "")[:30])
-        weight_label = f"Weight: {card.get('weight', 0):.1f}" if card.get("weight") else ""
-        st.markdown(f"**Card {current_idx + 1} / {len(cards)}** — {topic_label} {weight_label}")
+        st.markdown(
+            f"<div style='text-align:right;padding-top:8px;"
+            f"font-family:JetBrains Mono,monospace;font-size:12px;color:#555;'>"
+            f"{len(cards)} cards</div>",
+            unsafe_allow_html=True,
+        )
 
-    with col3:
-        if st.button("Next →", use_container_width=True):
-            st.session_state[f"card_idx_{subject}"] = min(len(cards) - 1, current_idx + 1)
-            st.session_state[f"flipped_{subject}"] = False
-            st.rerun()
+    filtered = cards if selected_topic == "All" else [
+        c for c in cards if c["topic"] == selected_topic
+    ]
 
-    is_flipped = st.session_state[f"flipped_{subject}"]
+    if not filtered:
+        st.info("No cards for this topic.")
+        return
 
-    if not is_flipped:
-        st.markdown(f"""
-                    
-        
-        <div style='
-    background: linear-gradient(
-    135deg,
-    rgba(18, 14, 2, 1) 0%,
-    rgba(45, 38, 12, 1) 50%,
-    rgba(18, 14, 2, 1) 100%
-);
-            padding: 50px 40px;
-            border-radius: 15px;
-            text-align: center;
-            margin: 20px 0;
-            min-height: 220px;
-            box-shadow: 0 8px 16px rgba(0,0,0,0.2);
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-        '>
-            <p style='color: #e0e0e0; font-size: 13px; margin: 0 0 15px 0; letter-spacing: 2px;'>QUESTION</p>
-            <p style='color: white; font-size: 18px; margin: 0; font-weight: 500; line-height: 1.6;'>{card.get("front", "No question")}</p>
-            <p style='color: #c0c0c0; font-size: 12px; margin: 20px 0 0 0;'>Click Flip to reveal answer</p>
-        </div>
-        """, unsafe_allow_html=True)
+    # ── Card navigator state ──
+    if "fc_index" not in st.session_state:
+        st.session_state.fc_index = 0
+    if "fc_flipped" not in st.session_state:
+        st.session_state.fc_flipped = False
+
+    # Reset if out of bounds
+    if st.session_state.fc_index >= len(filtered):
+        st.session_state.fc_index = 0
+        st.session_state.fc_flipped = False
+
+    idx   = st.session_state.fc_index
+    card  = filtered[idx]
+    flipped = st.session_state.fc_flipped
+
+    # ── Progress bar ──
+    progress = (idx + 1) / len(filtered)
+    st.markdown(
+        f"<div style='background:#1a1a1a;border-radius:4px;height:3px;"
+        f"margin-bottom:24px;overflow:hidden;'>"
+        f"<div style='background:#3b82f6;width:{progress*100:.1f}%;"
+        f"height:100%;border-radius:4px;transition:width 0.3s;'></div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Card face ──
+    if not flipped:
+        face_bg    = "#0f172a"
+        face_label = "FRONT"
+        face_color = "#3b82f6"
+        face_text  = card["front"]
+        hint       = "Click 'Flip' to reveal the answer"
     else:
-        back_text = card.get("back", "No answer available").replace("\n", "<br>")
-        st.markdown(f"""
-        <div style='
-                background: linear-gradient(
-                135deg,
-                rgba(5, 60, 20, 0.95) 0%,
-                rgba(15, 40, 25, 1) 50%,
-                rgba(5, 60, 20, 0.95) 100%
-            );
-            padding: 50px 40px;
-            border-radius: 15px;
-            text-align: center;
-            margin: 20px 0;
-            min-height: 220px;
-            box-shadow: 0 8px 16px rgba(0,0,0,0.2);
-        '>
-            <p style='color: #e0e0e0; font-size: 13px; margin: 0 0 15px 0; letter-spacing: 2px;'>ANSWER</p>
-            <p style='color: white; font-size: 16px; margin: 0; line-height: 1.8;'>{back_text}</p>
-        </div>
-        """, unsafe_allow_html=True)
+        face_bg    = "#0a140a"
+        face_label = "BACK"
+        face_color = "#22c55e"
+        face_text  = card["back"] or "No answer recorded."
+        hint       = ""
 
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        if st.button("Flip Card", use_container_width=True, key="flip_btn"):
-            st.session_state[f"flipped_{subject}"] = not is_flipped
+    topic_badge = (
+        f"<span style='background:rgba(59,130,246,0.1);color:#3b82f6;"
+        f"border:1px solid rgba(59,130,246,0.2);font-size:10px;"
+        f"font-weight:600;padding:2px 8px;border-radius:4px;"
+        f"font-family:Inter,sans-serif;'>{card['topic']}</span>"
+        if card["topic"] else ""
+    )
+
+    st.markdown(
+        f"<div style='background:{face_bg};border:1px solid #2a2a2a;"
+        f"border-radius:12px;padding:40px 32px;min-height:180px;"
+        f"display:flex;flex-direction:column;align-items:center;"
+        f"justify-content:center;text-align:center;margin-bottom:16px;'>"
+        f"<p style='font-family:JetBrains Mono,monospace;font-size:10px;"
+        f"color:{face_color};letter-spacing:2px;margin:0 0 20px 0;'>"
+        f"// {face_label}</p>"
+        f"<p style='font-family:Inter,sans-serif;font-size:17px;"
+        f"font-weight:500;color:#e6e6e6;margin:0 0 20px 0;line-height:1.6;'>"
+        f"{face_text}</p>"
+        f"{topic_badge}"
+        f"{'<p style=\"font-family:Inter,sans-serif;font-size:11px;color:#555;margin:16px 0 0 0;\">' + hint + '</p>' if hint else ''}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Controls ──
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 2, 1, 1])
+
+    with c1:
+        if st.button("◀ Prev", key="fc_prev", use_container_width=True):
+            st.session_state.fc_index   = (idx - 1) % len(filtered)
+            st.session_state.fc_flipped = False
             st.rerun()
-    with col_b:
-        st.progress((current_idx + 1) / len(cards))
+
+    with c2:
+        if st.button("▶ Next", key="fc_next", use_container_width=True):
+            st.session_state.fc_index   = (idx + 1) % len(filtered)
+            st.session_state.fc_flipped = False
+            st.rerun()
+
+    with c3:
+        label = "🔒 Hide Answer" if flipped else "🔓 Flip"
+        if st.button(label, key="fc_flip", use_container_width=True):
+            st.session_state.fc_flipped = not flipped
+            st.rerun()
+
+    with c4:
+        if st.button("↩ Reset", key="fc_reset", use_container_width=True):
+            st.session_state.fc_index   = 0
+            st.session_state.fc_flipped = False
+            st.rerun()
+
+    with c5:
+        st.markdown(
+            f"<div style='text-align:center;padding-top:6px;"
+            f"font-family:JetBrains Mono,monospace;font-size:12px;color:#555;'>"
+            f"{idx + 1} / {len(filtered)}</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── All cards list (collapsed) ──
+    with st.expander(f"View all {len(filtered)} cards", expanded=False):
+        for ci, c in enumerate(filtered):
+            st.markdown(
+                f"<div style='border:1px solid #2a2a2a;border-radius:8px;"
+                f"padding:12px 16px;margin-bottom:8px;'>"
+                f"<p style='font-family:JetBrains Mono,monospace;font-size:10px;"
+                f"color:#3b82f6;margin:0 0 6px 0;'>CARD {ci+1} · {c['topic']}</p>"
+                f"<p style='font-family:Inter,sans-serif;font-size:13px;"
+                f"color:#e6e6e6;margin:0 0 4px 0;font-weight:500;'>{c['front']}</p>"
+                f"<p style='font-family:Inter,sans-serif;font-size:12px;"
+                f"color:#888;margin:0;'>{c['back']}</p>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )

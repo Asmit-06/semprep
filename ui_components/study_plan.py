@@ -1,289 +1,256 @@
 import streamlit as st
+import re
 
 
-def render_study_plan(data, days_remaining):
-    weighted_topics = data.get("weighted_topics", {})
+# ─────────────────────────────────────────────────────────────
+# PARSER
+# ─────────────────────────────────────────────────────────────
 
-    topics_list = []
-    if isinstance(weighted_topics, dict):
-        if "weighted_topics" in weighted_topics:
-            topics_list = weighted_topics["weighted_topics"]
-        elif "topics" in weighted_topics:
-            topics_list = weighted_topics["topics"]
-    elif isinstance(weighted_topics, list):
-        topics_list = weighted_topics
+def parse_study_plan(sp_text: str) -> list:
+    """
+    Canonical format:
+        ## DAY: 1
+        TOPICS: Finite Automata||Regular Expressions
+        HOURS: 2.0
+        STATUS: pending
+        FOCUS: Master DFA construction
+        ---
 
-    subject = data.get("subject", "default")
+    Returns list of {day, topics, hours, status, focus}
+    """
+    if not sp_text:
+        return []
 
-    # ── HEADER ─────────────────────────────────────────────
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.markdown(
-            "<p style='font-family:Inter,sans-serif;font-size:11px;font-weight:600;"
-            "letter-spacing:1.5px;text-transform:uppercase;color:#888;margin:0 0 4px 0;'>"
-            "STUDY PLAN</p>"
-            "<p style='font-family:Inter,sans-serif;font-size:13px;color:#666;margin:0;'>"
-            "Day-by-day breakdown based on topic weights</p>",
-            unsafe_allow_html=True
-        )
-    with col2:
-        st.markdown(
-            f"<div style='text-align:right;'>"
-            f"<span style='font-family:JetBrains Mono,monospace;font-size:40px;"
-            f"font-weight:700;color:#faff69;letter-spacing:-1px;'>{days_remaining}</span>"
-            f"<p style='font-family:Inter,sans-serif;font-size:11px;color:#666;"
-            f"margin:0;letter-spacing:1px;text-transform:uppercase;'>days left</p>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
+    sp_text = re.sub(r"```[a-z]*\n?", "", sp_text).replace("```", "").strip()
 
-    st.markdown("<hr style='border-color:#2a2a2a;margin:20px 0 28px 0;'>",
-                unsafe_allow_html=True)
+    days = []
 
-    if not topics_list:
+    day_blocks = re.split(r'\n##\s+DAY:\s*', sp_text)
+
+    for block in day_blocks:
+        block = block.strip()
+        if not block or block.startswith("# "):
+            continue
+
+        lines = block.split("\n", 1)
+        try:
+            day_num = int(lines[0].strip())
+        except ValueError:
+            day_num = len(days) + 1
+
+        body = lines[1] if len(lines) > 1 else ""
+
+        # Topics: split by || (canonical) or comma (legacy)
+        topics_raw = _field(body, "TOPICS") or ""
+        if "||" in topics_raw:
+            topics = [t.strip() for t in topics_raw.split("||") if t.strip()]
+        else:
+            topics = [t.strip() for t in topics_raw.split(",") if t.strip()]
+
+        hours_raw = _field(body, "HOURS") or "2.0"
+        try:
+            hours = float(hours_raw)
+        except Exception:
+            hours = 2.0
+
+        status = _field(body, "STATUS") or "pending"
+        focus  = _field(body, "FOCUS")  or ""
+        questions = _field(body, "QUESTIONS") or ""
+        flashcards_review = _field(body, "FLASHCARDS") or ""
+
+        days.append({
+            "day":       day_num,
+            "topics":    topics,
+            "hours":     hours,
+            "status":    status,
+            "focus":     focus,
+            "questions": questions,
+            "flashcards": flashcards_review,
+        })
+
+    # Fallback
+    if not days:
+        days = _parse_legacy_study_plan(sp_text)
+
+    return sorted(days, key=lambda d: d["day"])
+
+
+def _field(text: str, name: str) -> str:
+    m = re.search(rf'^{name}:\s*(.+)$', text, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _parse_legacy_study_plan(text: str) -> list:
+    """Fallback: ## Day N / **Topics:** format."""
+    days = []
+    blocks = re.split(r'\n##\s+Day\s+', text, flags=re.IGNORECASE)
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.split("\n", 1)
+        try:
+            day_num = int(lines[0].strip())
+        except Exception:
+            continue
+        body = lines[1] if len(lines) > 1 else ""
+
+        topics_m = re.search(r'\*\*Topics?:?\*\*\s*(.+)', body)
+        hours_m  = re.search(r'\*\*Estimated hours?:?\*\*\s*([\d.]+)', body, re.IGNORECASE)
+        topics_raw = topics_m.group(1).strip() if topics_m else ""
+        topics = [t.strip() for t in re.split(r'[,;]', topics_raw) if t.strip()]
+        hours  = float(hours_m.group(1)) if hours_m else 2.0
+
+        days.append({
+            "day": day_num, "topics": topics, "hours": hours,
+            "status": "pending", "focus": "", "questions": "", "flashcards": "",
+        })
+    return days
+
+
+# ─────────────────────────────────────────────────────────────
+# RENDER
+# ─────────────────────────────────────────────────────────────
+
+_STATUS_COLORS = {
+    "completed":   ("#22c55e", "rgba(34,197,94,0.1)"),
+    "in_progress": ("#f59e0b", "rgba(245,158,11,0.1)"),
+    "skipped":     ("#888",    "rgba(136,136,136,0.1)"),
+    "pending":     ("#3b82f6", "rgba(59,130,246,0.06)"),
+}
+
+
+def _status_badge(status: str) -> str:
+    s = status.lower().replace(" ", "_")
+    color, bg = _STATUS_COLORS.get(s, ("#888", "rgba(136,136,136,0.1)"))
+    return (
+        f"<span style='background:{bg};color:{color};"
+        f"border:1px solid {color}33;font-size:10px;"
+        f"font-weight:600;padding:2px 8px;border-radius:4px;"
+        f"font-family:Inter,sans-serif;text-transform:uppercase;'>"
+        f"{status.replace('_',' ')}</span>"
+    )
+
+
+def render_study_plan(data: dict,days_remaining: int = None):
+    sp_text = data.get("study_plan", "") or ""
+    sp_text = re.sub(r"```[a-z]*\n?", "", sp_text).replace("```", "").strip()
+
+    if not sp_text:
         st.markdown(
             "<div style='text-align:center;padding:60px 20px;color:#444;"
             "font-family:Inter,sans-serif;font-size:14px;'>"
-            "No topics available. Re-run analysis to generate plan."
-            "</div>",
-            unsafe_allow_html=True
+            "No study plan available.</div>",
+            unsafe_allow_html=True,
         )
         return
 
-    # ── BUILD DAY PLAN ─────────────────────────────────────
-    critical = [t for t in topics_list if t.get("weight", 0) >= 9]
-    high = [t for t in topics_list if 7 <= t.get("weight", 0) < 9]
-    medium = [t for t in topics_list if 5 <= t.get("weight", 0) < 7]
+    days = parse_study_plan(sp_text)
 
-    day_plan = []
-    if critical:
-        day_plan.append({
-            "day": 1, "label": "CRITICAL FOCUS",
-            "topics": critical[:2],
-            "color": "#ef4444", "hours": "4-6h", "revision": False
-        })
-    if high:
-        day_plan.append({
-            "day": 2, "label": "HIGH PRIORITY",
-            "topics": high[:2],
-            "color": "#f59e0b", "hours": "3-4h", "revision": False
-        })
-    if len(high) > 2:
-        day_plan.append({
-            "day": 3, "label": "HIGH PRIORITY",
-            "topics": high[2:],
-            "color": "#f59e0b", "hours": "3-4h", "revision": False
-        })
-    if medium and days_remaining > 3:
-        day_plan.append({
-            "day": 4, "label": "MEDIUM PRIORITY",
-            "topics": medium[:3],
-            "color": "#22c55e", "hours": "2-3h", "revision": False
-        })
-    if days_remaining >= 2:
-        day_plan.append({
-            "day": days_remaining, "label": "REVISION DAY",
-            "topics": [],
-            "color": "#faff69", "hours": "2-3h", "revision": True
-        })
+    if not days:
+        st.warning("Could not parse study plan. Showing raw output below.")
+        with st.expander("Raw study plan"):
+            st.text(sp_text[:5000])
+        return
 
-    # ── OVERALL PROGRESS ──────────────────────────────────
-    if "study_progress" not in st.session_state:
-        st.session_state.study_progress = {}
-
-    if subject not in st.session_state.study_progress:
-        st.session_state.study_progress[subject] = {}
-
-    progress_data = st.session_state.study_progress[subject]
-
-    total_topics = sum(len(d["topics"]) for d in day_plan if not d["revision"])
-    completed_topics = sum(
-        1 for k, v in progress_data.items()
-        if v and k.startswith(subject)
-    )
-
-    if total_topics > 0:
-        overall_pct = int((completed_topics / total_topics) * 100)
-    else:
-        overall_pct = 0
+    # ── Header stats ──
+    total_hours = sum(d["hours"] for d in days)
+    completed   = sum(1 for d in days if d["status"] == "completed")
 
     st.markdown(
-        f"<div style='background:#0f0f0f;border:1px solid #222;border-radius:10px;"
-        f"padding:14px 18px;margin-bottom:24px;'>"
-        f"<div style='display:flex;justify-content:space-between;align-items:center;"
-        f"margin-bottom:8px;'>"
-        f"<span style='font-family:JetBrains Mono,monospace;font-size:11px;"
-        f"color:#888;letter-spacing:1px;'>OVERALL PROGRESS</span>"
-        f"<span style='font-family:JetBrains Mono,monospace;font-size:13px;"
-        f"color:#faff69;font-weight:600;'>{completed_topics}/{total_topics} · {overall_pct}%</span>"
-        f"</div>"
-        f"<div style='background:#1a1a1a;height:6px;border-radius:3px;overflow:hidden;'>"
-        f"<div style='background:#faff69;height:100%;width:{overall_pct}%;"
-        f"transition:width 0.3s;'></div>"
-        f"</div>"
+        f"<div style='display:flex;gap:24px;margin-bottom:28px;flex-wrap:wrap;'>"
+        f"<div><p style='font-family:JetBrains Mono,monospace;font-size:10px;"
+        f"color:#555;margin:0;letter-spacing:1px;'>TOTAL DAYS</p>"
+        f"<p style='font-family:Inter,sans-serif;font-size:24px;font-weight:700;"
+        f"color:#fff;margin:0;'>{len(days)}</p></div>"
+        f"<div><p style='font-family:JetBrains Mono,monospace;font-size:10px;"
+        f"color:#555;margin:0;letter-spacing:1px;'>TOTAL HOURS</p>"
+        f"<p style='font-family:Inter,sans-serif;font-size:24px;font-weight:700;"
+        f"color:#fff;margin:0;'>{total_hours:.1f}h</p></div>"
+        f"<div><p style='font-family:JetBrains Mono,monospace;font-size:10px;"
+        f"color:#555;margin:0;letter-spacing:1px;'>COMPLETED</p>"
+        f"<p style='font-family:Inter,sans-serif;font-size:24px;font-weight:700;"
+        f"color:#22c55e;margin:0;'>{completed}/{len(days)}</p></div>"
         f"</div>",
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
+    # ── Days remaining banner —──────────────
+    if days_remaining is not None:
+        urgency_color = (
+            "#ef4444" if days_remaining <= 3
+            else "#f59e0b" if days_remaining <= 7
+            else "#22c55e"
+        )
+        st.markdown(
+            f"<div style='background:rgba(0,0,0,0.3);"
+            f"border:1px solid {urgency_color}33;"
+            f"border-radius:8px;padding:10px 16px;margin-bottom:20px;"
+            f"display:flex;align-items:center;gap:10px;'>"
+            f"<span style='font-family:JetBrains Mono,monospace;font-size:20px;"
+            f"font-weight:700;color:{urgency_color};'>{days_remaining}</span>"
+            f"<span style='font-family:Inter,sans-serif;font-size:12px;color:#888;'>"
+            f"days until exam</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    # ── Day cards ──
+    for day in days:
+        day_num = day["day"]
+        topics  = day["topics"]
+        status  = day["status"]
+        color, bg = _STATUS_COLORS.get(
+            status.lower().replace(" ", "_"),
+            ("#888", "rgba(136,136,136,0.06)")
+        )
 
-    # ── RENDER EACH DAY ───────────────────────────────────
-    for entry in day_plan:
-        day_num = entry["day"]
-        label = entry["label"]
-        color = entry["color"]
-        hours = entry["hours"]
-        topics = entry["topics"]
-        is_revision = entry["revision"]
+        st.markdown(
+            f"<div style='border:1px solid #2a2a2a;border-radius:10px;"
+            f"background:{bg};padding:16px 20px;margin-bottom:8px;'>"
+            f"<div style='display:flex;align-items:center;gap:12px;"
+            f"margin-bottom:10px;flex-wrap:wrap;'>"
+            f"<span style='font-family:JetBrains Mono,monospace;font-size:13px;"
+            f"color:{color};font-weight:700;'>DAY {day_num}</span>"
+            f"{_status_badge(status)}"
+            f"<span style='font-family:JetBrains Mono,monospace;font-size:11px;"
+            f"color:#555;margin-left:auto;'>{day['hours']:.1f}h</span>"
+            f"</div>"
+            + (
+                f"<p style='font-family:Inter,sans-serif;font-size:12px;"
+                f"color:#888;margin:0 0 10px 0;font-style:italic;'>{day['focus']}</p>"
+                if day["focus"] else ""
+            )
+            + f"</div>",
+            unsafe_allow_html=True,
+        )
 
-        # Day topics completed count
-        day_completed = 0
-        day_total = len(topics)
-        for topic in topics:
-            key = f"{subject}_day{day_num}_{topic.get('topic_name', topic.get('name', ''))}"
-            if progress_data.get(key, False):
-                day_completed += 1
+        # ── Topic checkboxes — KEY uses day_num + topic_index (never topic text) ──
+        for ti, topic in enumerate(topics):
+            checked = st.checkbox(
+                topic,
+                key=f"sp_day{day_num}_t{ti}",   # ← day_num + index, never topic text
+            )
+            # Visual feedback (can't change HTML after render, so just indent)
+            if checked:
+                st.markdown(
+                    f"<p style='font-family:JetBrains Mono,monospace;"
+                    f"font-size:10px;color:#22c55e;margin:-8px 0 4px 24px;'>"
+                    f"✓ done</p>",
+                    unsafe_allow_html=True,
+                )
 
-        if day_total > 0:
-            day_pct = int((day_completed / day_total) * 100)
-        else:
-            day_pct = 100 if is_revision else 0
-
-        # Day header with expander
-        text_color = "#0a0a0a" if color == "#faff69" else "#ffffff"
-
-        expander_label = f"Day {day_num}  ·  {label}  ·  {hours}"
-        if not is_revision:
-            expander_label += f"  ·  {day_completed}/{day_total} done"
-
-        with st.expander(expander_label, expanded=(day_num <= 2)):
-
-            # Color bar on top
+        if day.get("questions"):
             st.markdown(
-                f"<div style='height:3px;background:{color};border-radius:2px;"
-                f"margin:0 0 16px 0;'></div>",
-                unsafe_allow_html=True
+                f"<p style='font-family:Inter,sans-serif;font-size:12px;"
+                f"color:#888;margin:6px 0 0 0;'>"
+                f"📝 Practice: {day['questions']}</p>",
+                unsafe_allow_html=True,
+            )
+        if day.get("flashcards"):
+            st.markdown(
+                f"<p style='font-family:Inter,sans-serif;font-size:12px;"
+                f"color:#888;margin:2px 0 8px 0;'>"
+                f"🃏 Review: {day['flashcards']}</p>",
+                unsafe_allow_html=True,
             )
 
-            if is_revision:
-                st.markdown(
-                    "<div style='background:#161616;border:1px solid #222;"
-                    "border-radius:8px;padding:16px 20px;'>"
-                    "<p style='font-family:Inter,sans-serif;font-size:13px;"
-                    "color:#999;margin:0;line-height:1.7;'>"
-                    "📚 No new topics today.<br>"
-                    "Review all CRITICAL and HIGH priority topics.<br>"
-                    "Go through flashcards and cheat sheet."
-                    "</p>"
-                    "</div>",
-                    unsafe_allow_html=True
-                )
-            else:
-                # Day progress bar
-                st.markdown(
-                    f"<div style='display:flex;justify-content:space-between;"
-                    f"align-items:center;margin-bottom:10px;'>"
-                    f"<span style='font-family:JetBrains Mono,monospace;font-size:10px;"
-                    f"color:#666;letter-spacing:1px;'>DAY PROGRESS</span>"
-                    f"<span style='font-family:JetBrains Mono,monospace;font-size:11px;"
-                    f"color:{color};font-weight:600;'>{day_pct}%</span>"
-                    f"</div>"
-                    f"<div style='background:#1a1a1a;height:4px;border-radius:2px;"
-                    f"overflow:hidden;margin-bottom:18px;'>"
-                    f"<div style='background:{color};height:100%;width:{day_pct}%;'></div>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-
-                # Topic checklist
-                for idx, topic in enumerate(topics):
-                    name = topic.get("topic_name", topic.get("name", "Unknown"))
-                    weight = topic.get("weight", 0)
-                    years = topic.get("years_appeared", [])
-                    typical_marks = topic.get("typical_marks", "")
-                    unit = topic.get("unit", "")
-
-                    key = f"{subject}_day{day_num}_{name}"
-                    is_done = progress_data.get(key, False)
-
-                    # Render topic card
-                    year_str = " · ".join(map(str, years)) if years else ""
-                    pyq_badge = (
-                        f"<span style='font-family:JetBrains Mono,monospace;"
-                        f"font-size:10px;color:#faff69;margin-left:10px;'>"
-                        f"PYQ {year_str}</span>"
-                        if year_str else ""
-                    )
-
-                    marks_badge = (
-                        f"<span style='font-family:JetBrains Mono,monospace;"
-                        f"font-size:10px;color:#666;margin-left:10px;'>"
-                        f"{typical_marks}M</span>"
-                        if typical_marks else ""
-                    )
-
-                    unit_badge = (
-                        f"<span style='font-family:JetBrains Mono,monospace;"
-                        f"font-size:10px;color:#666;margin-left:10px;'>"
-                        f"{unit}</span>"
-                        if unit else ""
-                    )
-
-                    opacity = "0.5" if is_done else "1"
-                    line_through = "text-decoration:line-through;" if is_done else ""
-
-                    topic_html = (
-                        f"<div style='background:#111;border:1px solid #222;"
-                        f"border-left:3px solid {color};border-radius:6px;"
-                        f"padding:12px 16px;margin-bottom:8px;opacity:{opacity};'>"
-                        f"<div style='display:flex;justify-content:space-between;"
-                        f"align-items:center;'>"
-                        f"<div style='{line_through}'>"
-                        f"<span style='font-family:Inter,sans-serif;font-size:14px;"
-                        f"font-weight:500;color:#e6e6e6;'>{name}</span>"
-                        f"{marks_badge}"
-                        f"{unit_badge}"
-                        f"{pyq_badge}"
-                        f"</div>"
-                        f"<span style='font-family:JetBrains Mono,monospace;"
-                        f"font-size:12px;color:{color};font-weight:600;'>"
-                        f"{weight:.1f}</span>"
-                        f"</div>"
-                        f"</div>"
-                    )
-
-                    st.markdown(topic_html, unsafe_allow_html=True)
-
-                    # Checkbox
-                    checked = st.checkbox(
-                        f"Mark complete",
-                        value=is_done,
-                        key=f"check_{key}"
-                    )
-
-                    if checked != is_done:
-                        progress_data[key] = checked
-                        st.rerun()
-
-                # Mark day complete button
-                if day_completed < day_total:
-                    if st.button(
-                        f"✓ Mark Day {day_num} Complete",
-                        key=f"day_complete_{day_num}",
-                        use_container_width=True
-                    ):
-                        for topic in topics:
-                            name = topic.get("topic_name", topic.get("name", "Unknown"))
-                            key = f"{subject}_day{day_num}_{name}"
-                            progress_data[key] = True
-                        st.rerun()
-                else:
-                    st.markdown(
-                        f"<div style='background:rgba(34,197,94,0.08);"
-                        f"border:1px solid rgba(34,197,94,0.2);border-radius:6px;"
-                        f"padding:10px 16px;text-align:center;margin-top:8px;'>"
-                        f"<span style='font-family:Inter,sans-serif;font-size:12px;"
-                        f"color:#22c55e;font-weight:600;'>"
-                        f"✓ DAY {day_num} COMPLETED"
-                        f"</span>"
-                        f"</div>",
-                        unsafe_allow_html=True
-                    )
+        st.markdown("<div style='margin-bottom:4px;'></div>", unsafe_allow_html=True)
