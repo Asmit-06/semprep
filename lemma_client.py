@@ -36,24 +36,22 @@ if not LEMMA_ORG_ID:
     raise RuntimeError("LEMMA_ORG_ID missing in .env or secrets")
 
 # Auth mode detection
-_USE_CLOUD_AUTH = bool(LEMMA_REFRESH_TOKEN) or bool(os.getenv("LEMMA_ACCESS_TOKEN"))   # Cloud mode — refresh token
-_USE_CONFIG_AUTH = bool(LEMMA_CONFIG_PATH)     # Local mode — config file
+LEMMA_CONFIG_JSON   = os.getenv("LEMMA_CONFIG_JSON")
+
+_USE_CLOUD_AUTH  = bool(LEMMA_CONFIG_JSON)
+_USE_CONFIG_AUTH = bool(LEMMA_CONFIG_PATH)
 
 if not _USE_CLOUD_AUTH and not _USE_CONFIG_AUTH:
     raise RuntimeError(
         "No auth method found.\n"
         "  Local:  set LEMMA_CONFIG_PATH in .env\n"
-        "  Cloud:  set LEMMA_REFRESH_TOKEN in Streamlit secrets"
+        "  Cloud:  set LEMMA_CONFIG_JSON in Streamlit secrets"
     )
 
-# Validate config file exists (local mode only)
 if _USE_CONFIG_AUTH and not _USE_CLOUD_AUTH:
     CONFIG_PATH = Path(LEMMA_CONFIG_PATH)
     if not CONFIG_PATH.exists():
-        raise RuntimeError(
-            f"Lemma config not found at {CONFIG_PATH}.\n"
-            f"Run: lemma auth login"
-        )
+        raise RuntimeError(f"Lemma config not found at {CONFIG_PATH}")
 else:
     CONFIG_PATH = None
 
@@ -62,36 +60,15 @@ else:
 # Client Factories
 # ============================================================
 def get_client() -> Lemma:
-    """
-    Authenticated root client.
-    Cloud mode:  builds temp config from refresh token — SDK auto-rotates.
-    Local mode:  reads from WSL/native CLI config file.
-    """
-    if _USE_CLOUD_AUTH:
-        # Build a minimal config structure that matches CLI format
-        temp_config = {
-    "active_server": "cloud",
-    "servers": {
-        "cloud": {
-            "token": os.getenv("LEMMA_ACCESS_TOKEN", ""),
-            "refresh_token": LEMMA_REFRESH_TOKEN,
-            "base_url": LEMMA_API_URL,
-            "auth_url": "https://lemma.work/auth",
-            "defaults": {
-                "org_id": LEMMA_ORG_ID,
-                "pod_id": LEMMA_POD_ID,
-            },
-        }
-    },
-}
+    config_json = os.getenv("LEMMA_CONFIG_JSON")
 
-        # Write to a temp file so SDK can read it as config_path
+    if config_json:
+        # Cloud mode — write config JSON from env var to temp file
         tmp = tempfile.NamedTemporaryFile(
             delete=False, suffix=".json", mode="w", encoding="utf-8"
         )
-        json.dump(temp_config, tmp)
+        tmp.write(config_json)
         tmp.close()
-
         return Lemma(
             config_path=Path(tmp.name),
             org_id=LEMMA_ORG_ID,
@@ -99,14 +76,13 @@ def get_client() -> Lemma:
             timeout=LEMMA_TIMEOUT,
         )
     else:
-        # Local dev mode
+        # Local mode
         return Lemma(
             config_path=CONFIG_PATH,
             org_id=LEMMA_ORG_ID,
             pod_id=LEMMA_POD_ID,
             timeout=LEMMA_TIMEOUT,
         )
-
 
 def get_pod() -> Pod:
     """Pod-scoped client. Use for tables, agents, records, workflows."""
