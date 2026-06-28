@@ -3,4 +3,4 @@ python-dotenv
 pymupdf
 pytesseract
 lemma_sdk
-Pillows
+Pillow
