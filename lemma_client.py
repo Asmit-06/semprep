@@ -62,19 +62,18 @@ else:
 # ============================================================
 def get_client() -> Lemma:
     """
-    Authenticated root client.
-    Cloud mode: dynamically builds config.json so SDK handles refresh.
-    Local mode: uses existing config_path.
+    Stable cloud auth using refresh token only.
+    SDK will create and rotate access tokens automatically.
     """
 
-    if _USE_TOKEN_AUTH:
-        # Build temporary config structure like real CLI config
+    refresh_token = os.getenv("LEMMA_REFRESH_TOKEN")
+
+    if refresh_token:
         temp_config = {
             "active_server": "cloud",
             "servers": {
                 "cloud": {
-                    "token": LEMMA_ACCESS_TOKEN,
-                    "refresh_token": os.getenv("LEMMA_REFRESH_TOKEN"),
+                    "refresh_token": refresh_token,
                     "base_url": LEMMA_API_URL,
                     "defaults": {
                         "org_id": LEMMA_ORG_ID,
@@ -84,8 +83,9 @@ def get_client() -> Lemma:
             },
         }
 
-        # Write to temp file
         import tempfile, json
+        from pathlib import Path
+
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
         temp_file.write(json.dumps(temp_config).encode())
         temp_file.close()
@@ -105,7 +105,6 @@ def get_client() -> Lemma:
             pod_id=LEMMA_POD_ID,
             timeout=LEMMA_TIMEOUT,
         )
-
 def get_pod() -> Pod:
     """Pod-scoped client. Use for tables, agents, records, workflows."""
     return get_client().pod(LEMMA_POD_ID)
