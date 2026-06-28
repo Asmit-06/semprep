@@ -36,7 +36,7 @@ if not LEMMA_ORG_ID:
     raise RuntimeError("LEMMA_ORG_ID missing in .env or secrets")
 
 # Auth mode detection
-_USE_CLOUD_AUTH  = bool(LEMMA_REFRESH_TOKEN)   # Cloud mode — refresh token
+_USE_CLOUD_AUTH = bool(LEMMA_REFRESH_TOKEN) or bool(os.getenv("LEMMA_ACCESS_TOKEN"))   # Cloud mode — refresh token
 _USE_CONFIG_AUTH = bool(LEMMA_CONFIG_PATH)     # Local mode — config file
 
 if not _USE_CLOUD_AUTH and not _USE_CONFIG_AUTH:
@@ -70,18 +70,20 @@ def get_client() -> Lemma:
     if _USE_CLOUD_AUTH:
         # Build a minimal config structure that matches CLI format
         temp_config = {
-            "active_server": "cloud",
-            "servers": {
-                "cloud": {
-                    "refresh_token": LEMMA_REFRESH_TOKEN,
-                    "base_url": LEMMA_API_URL,
-                    "defaults": {
-                        "org_id": LEMMA_ORG_ID,
-                        "pod_id": LEMMA_POD_ID,
-                    },
-                }
+    "active_server": "cloud",
+    "servers": {
+        "cloud": {
+            "token": os.getenv("LEMMA_ACCESS_TOKEN", ""),
+            "refresh_token": LEMMA_REFRESH_TOKEN,
+            "base_url": LEMMA_API_URL,
+            "auth_url": "https://lemma.work/auth",
+            "defaults": {
+                "org_id": LEMMA_ORG_ID,
+                "pod_id": LEMMA_POD_ID,
             },
         }
+    },
+}
 
         # Write to a temp file so SDK can read it as config_path
         tmp = tempfile.NamedTemporaryFile(
