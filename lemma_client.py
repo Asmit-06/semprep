@@ -69,12 +69,12 @@ def get_client() -> Lemma:
     if _USE_TOKEN_AUTH:
         # Streamlit Cloud / any environment with token in env var
         return Lemma(
-            api_key=LEMMA_ACCESS_TOKEN,
-            base_url=LEMMA_API_URL,
-            org_id=LEMMA_ORG_ID,
-            pod_id=LEMMA_POD_ID,
-            timeout=LEMMA_TIMEOUT,
-        )
+     token=LEMMA_ACCESS_TOKEN,
+     base_url=LEMMA_API_URL,
+     org_id=LEMMA_ORG_ID,
+     pod_id=LEMMA_POD_ID,
+     timeout=LEMMA_TIMEOUT,
+     )
     else:
         # Local dev — reads from WSL or native CLI config file
         return Lemma(
