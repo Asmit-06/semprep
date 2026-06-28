@@ -91,7 +91,7 @@ def get_client() -> Lemma:
         temp_file.close()
 
         return Lemma(
-            config_path=temp_file.name,
+            config_path=Path(temp_file.name),
             org_id=LEMMA_ORG_ID,
             pod_id=LEMMA_POD_ID,
             timeout=LEMMA_TIMEOUT,
